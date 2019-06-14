@@ -1,0 +1,83 @@
+pass_or_choke(State, V, Prev_t, Worker) ->
+    #eldap_lb_state{
+                    kappa=Kappa,
+                    work_list=Work_list,
+                    alarm=Alarm,
+                    prop=Prop} = State,  
+    Max=get_max(),
+    T = get_now(),
+    CurI = new_intensity(V, T, Prev_t, Kappa),
+    if CurI =< Max -> 
+        {Updated_alarm, Updated_wl} = clear_overload(Alarm, CurI, Max, Worker, Work_list),
+        {pass, State#eldap_lb_state{
+                    work_list = Updated_wl,
+                    alarm     = Updated_alarm,
+                    prop      = lists:keyreplace(Worker, 1, Prop, 
+                                                {Worker,{CurI+Kappa,T}})}};                     
+    true ->
+        {Updated_alarm, Updated_wl} = raise_overload(Alarm, Worker, Work_list),
+        {choke, State#eldap_lb_state{
+                    work_list = Updated_wl,
+                    alarm     = Updated_alarm,
+                    prop      = lists:keyreplace(Worker, 1, Prop, {Worker,{CurI,T}})}}
+    end.
+
+raise_overload(true, Worker, Work_list) -> 
+    New_wl =
+        case lists:member(Worker, Work_list) of
+            true  -> Work_list;
+            false -> [Worker|Work_list]
+        end,
+    {true, New_wl};
+raise_overload(false, Worker, Work_list) ->
+    New_wl =
+        case lists:member(Worker, Work_list) of
+            true  -> Work_list;
+            false -> [Worker|Work_list]
+        end,
+    eldap_fsm:raise_overload(Worker),   
+    {true, New_wl}.
+
+%%%
+%%%   Alarm hysteresis: The current intensity must drop
+%%%   below a 75% threshold before the alarm is cleared.
+%%%
+clear_overload(false,_,_, Worker, Work_list) -> 
+    {false, lists:delete(Worker,Work_list)};
+clear_overload(true, CurI, Max, _, Work_list) when CurI > 0.75 * Max -> 
+    {true, Work_list};
+clear_overload(true,_,_, Worker, Work_list) ->
+    case lists:delete(Worker, Work_list) of
+        [] ->
+            eldap_fsm:clear_overload(Worker),
+            {false, []};
+        Deleted_work_list ->
+            {true, Deleted_work_list}
+    end.
+
+new_intensity(I, T, PrevT, K) ->
+    Diff = sub(T,PrevT)/1000,
+    case catch (I*math:exp(-K*Diff)) of
+        {'EXIT', _} -> % Assume zero.
+	    0.0;
+        Res ->
+	    Res
+    end.
+
+%% To assign the Maximum no. of request to be accepted
+get_max()->
+    config:get_env(eldap_server,default_capping_rate,500).
+           
+%% Mask equal to 2^27 - 1, used below.
+-define(mask27, 16#7ffffff).
+
+%% Returns number of milliseconds in the range [0, 2^27 - 1]. Must have
+%% this since statistics(wall_clock) wraps. Having 2^27 -1 as the max
+%% assures that we always get non-negative integers. 2^27 milliseconds
+%% are approx. 37.28 hours.
+get_now() ->
+    element(1, statistics(wall_clock)) band ?mask27.
+	
+%% Returns (X - Y) mod 2^27 (which is in the range [0, 2^27 - 1]).
+sub(X, Y) ->
+    (X + (bnot Y) + 1) band ?mask27.
